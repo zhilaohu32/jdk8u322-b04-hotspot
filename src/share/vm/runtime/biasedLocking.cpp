@@ -551,6 +551,11 @@ public:
 };
 
 
+/**
+ * Handle obj：需要撤销偏向锁的对象
+ * bool attempt_rebias：是否需要重新偏向为当前线程
+ * TRAPS：传递异常信息的参数
+*/
 BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attempt_rebias, TRAPS) {
   assert(!SafepointSynchronize::is_at_safepoint(), "must not be called while at safepoint");
 
@@ -558,24 +563,51 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
   // efficiently enough that we should not cause these revocations to
   // update the heuristics because doing so may cause unwanted bulk
   // revocations (which are expensive) to occur.
-  markOop mark = obj->mark();
+  markOop mark = obj->mark(); // 获取对象头中的mark word
+
+  // 判断条件1 当前对象属于匿名偏向状态(mark word flag:101,偏向线程指针无记录) 并且 不需要重偏向到当前调用的线程
+  // 判断条件2 当前对象是偏向锁状态(mark word flag:101,偏向线程指针存在记录)
   if (mark->is_biased_anonymously() && !attempt_rebias) {
+    // 满足判断条件1
+    // mark word锁标志为匿名偏向状态，且入参attempt_rebias=false(不需要重偏向)
+    // 问题1：在什么情况下会发生匿名偏向状态存在，但不需要偏向？ 
+    // 回答问题1：当调用object.hashCode()的时候就会这样调用。所以说hashCode的调用会导致偏向锁的撤销。
+
+
     // We are probably trying to revoke the bias of this object due to
     // an identity hash code computation. Try to revoke the bias
     // without a safepoint. This is possible if we can successfully
     // compare-and-exchange an unbiased header into the mark word of
     // the object, meaning that no other thread has raced to acquire
     // the bias of the object.
-    markOop biased_value       = mark;
-    markOop unbiased_prototype = markOopDesc::prototype()->set_age(mark->age());
-    markOop res_mark = (markOop) Atomic::cmpxchg_ptr(unbiased_prototype, obj->mark_addr(), mark);
+    markOop biased_value       = mark; // 传入锁对象
+
+    /**
+     * markOopDesc::prototype() 是一个静态方法，用于返回一个默认的 mark word 原型对象。这个原型对象的值是一个常量，在 JVM 启动时就被初始化。
+      这个原型对象的类型是 markOopDesc，它的值对应于一个未偏向的对象。具体来说，它的值为 0x01，即二进制的 01，其中：
+      最高位（MSB）是对象的 GC 标记位，为 0；
+      第二位是偏向锁标志位，为 0，表示该对象未偏向；
+      后 30 位是对象的 age（年龄）值，为 0。
+      因此，这个 mark word 原型对象的值可以看作是一个未偏向、未被 GC 标记、age 值为 0 的对象的 mark word。在偏向锁被撤销时，
+      可以将对象的 mark word 用这个原型对象进行替换，以将对象的偏向状态置为未偏向。
+     * 
+    */
+    markOop unbiased_prototype = markOopDesc::prototype()->set_age(mark->age()); // 未偏向的标记头,并且设置分代年龄
+    // CAS原子修改锁对象的markWord
+    markOop res_mark = (markOop) Atomic::cmpxchg_ptr(unbiased_prototype, obj->mark_addr(), mark); 
+    // 修改成功后返回。即撤销成功
     if (res_mark == biased_value) {
+      // 返回撤销成功
       return BIAS_REVOKED;
     }
   } else if (mark->has_bias_pattern()) {
-    Klass* k = obj->klass();
-    markOop prototype_header = k->prototype_header();
+    // 满足判断条件2 
+    Klass* k = obj->klass(); // 获取对象的类型指针
+    markOop prototype_header = k->prototype_header(); // 获取对象类型的默认头信息，即包含偏向锁状态的默认值
+    
     if (!prototype_header->has_bias_pattern()) {
+      // 对象类的默认（原型头）锁标记位 不是101时 （非偏向锁状态）
+
       // This object has a stale bias from before the bulk revocation
       // for this data type occurred. It's pointless to update the
       // heuristics at this point so simply update the header with a
@@ -583,10 +615,16 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
       // by another thread so we simply return and let the caller deal
       // with it.
       markOop biased_value       = mark;
+      // CAS原子修改锁对象的markWord,撤销偏向锁；使用对象类的默认值进行替换。
       markOop res_mark = (markOop) Atomic::cmpxchg_ptr(prototype_header, obj->mark_addr(), mark);
+
+      // !obj.has_bias_pattern() 对象锁标记位不是101的断言
       assert(!(*(obj->mark_addr()))->has_bias_pattern(), "even if we raced, should still be revoked");
+      // 返回撤销成功
       return BIAS_REVOKED;
     } else if (prototype_header->bias_epoch() != mark->bias_epoch()) {
+      // 对象 与 对象类型的 epoch相等的话
+
       // The epoch of this biasing has expired indicating that the
       // object is effectively unbiased. Depending on whether we need
       // to rebias or revoke the bias of this object we can do it
@@ -594,8 +632,14 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
       // heuristics. This is normally done in the assembly code but we
       // can reach this point due to various points in the runtime
       // needing to revoke biases.
+      // 注释的中文对照：
+      // 这个对象在该数据类型进行批量撤销之前具有过时的偏向状态。
+      // 在这一点上更新启发式是毫无意义的，所以只需使用CAS更新头即可。
+      // 如果我们失败了，那么该对象的偏向已被另一个线程撤销，因此我们只需返回并让调用者处理即可。
+      
+      // 入参 attempt_rebias=true,需要重偏向到当前线程
       if (attempt_rebias) {
-        assert(THREAD->is_Java_thread(), "");
+        assert(THREAD->is_Java_thread(), "");// 断言当前线程是一个Java线程
         markOop biased_value       = mark;
         markOop rebiased_prototype = markOopDesc::encode((JavaThread*) THREAD, mark->age(), prototype_header->bias_epoch());
         markOop res_mark = (markOop) Atomic::cmpxchg_ptr(rebiased_prototype, obj->mark_addr(), mark);
@@ -603,8 +647,11 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
           return BIAS_REVOKED_AND_REBIASED;
         }
       } else {
+        // 入参 attempt_rebias=false,不需要重偏向到当前线程
         markOop biased_value       = mark;
+        // 获取一个默认mark word 原型，并且将当前对象的分代信息写入默认原型中
         markOop unbiased_prototype = markOopDesc::prototype()->set_age(mark->age());
+        // CAS修改，撤销偏向锁
         markOop res_mark = (markOop) Atomic::cmpxchg_ptr(unbiased_prototype, obj->mark_addr(), mark);
         if (res_mark == biased_value) {
           return BIAS_REVOKED;
@@ -613,6 +660,7 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
     }
   }
 
+  // ⬆⬆⬆ 在此之前的操作均为偏向锁的撤销与重偏向，如都未能成功则开始接下来的操作
   HeuristicsResult heuristics = update_heuristics(obj(), attempt_rebias);
   if (heuristics == HR_NOT_BIASED) {
     return NOT_BIASED;

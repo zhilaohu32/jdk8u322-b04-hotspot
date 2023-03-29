@@ -617,6 +617,7 @@ IRT_END
 //%note synchronization_3
 
 //%note monitor_1
+// 锁入口
 IRT_ENTRY_NO_ASYNC(void, InterpreterRuntime::monitorenter(JavaThread* thread, BasicObjectLock* elem))
 #ifdef ASSERT
   thread->last_frame().interpreter_frame_verify_monitor(elem);
@@ -627,10 +628,13 @@ IRT_ENTRY_NO_ASYNC(void, InterpreterRuntime::monitorenter(JavaThread* thread, Ba
   Handle h_obj(thread, elem->obj());
   assert(Universe::heap()->is_in_reserved_or_null(h_obj()),
          "must be NULL or an object");
+  // 是否开启偏向锁优化
   if (UseBiasedLocking) {
     // Retry fast entry if bias is revoked to avoid unnecessary inflation
+    // 调用偏向锁的加锁方法
     ObjectSynchronizer::fast_enter(h_obj, elem->lock(), true, CHECK);
   } else {
+      // 直接调用重量锁的锁方法
     ObjectSynchronizer::slow_enter(h_obj, elem->lock(), CHECK);
   }
   assert(Universe::heap()->is_in_reserved_or_null(elem->obj()),

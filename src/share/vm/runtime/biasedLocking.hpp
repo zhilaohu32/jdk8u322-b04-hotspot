@@ -159,8 +159,11 @@ public:
   static int* slow_path_entry_count_addr();
 
   enum Condition {
+    // 表示对象不具有偏向锁，或偏向锁已被撤销；
     NOT_BIASED = 1,
+    // 表示对象具有偏向锁，且偏向锁已经被撤销；
     BIAS_REVOKED = 2,
+    // 表示对象具有偏向锁，且偏向锁已经被撤销，并且成功地将偏向锁重新偏向到了当前线程。
     BIAS_REVOKED_AND_REBIASED = 3
   };
 

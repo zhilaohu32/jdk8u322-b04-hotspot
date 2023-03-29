@@ -167,13 +167,18 @@ static volatile int MonitorPopulation = 0 ;      // # Extant -- in circulation
 // extremely sensitive to race condition. Be careful.
 
 void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_rebias, TRAPS) {
+  // 判断是否启用偏向锁优化
  if (UseBiasedLocking) {
+    // 判断当前是否处于安全点状态
     if (!SafepointSynchronize::is_at_safepoint()) {
+      // 处于安全点状态，使用revoke_and_rebias()撤销一个对象的偏向锁并重新偏向为当前线程
+      // 疑问：为什么revoke_and_rebias可以不在安全点上进行偏向锁的撤销?
       BiasedLocking::Condition cond = BiasedLocking::revoke_and_rebias(obj, attempt_rebias, THREAD);
       if (cond == BiasedLocking::BIAS_REVOKED_AND_REBIASED) {
         return;
       }
     } else {
+      // 处在安全点状态，在安全点上对偏向锁撤销
       assert(!attempt_rebias, "can not rebias toward VM thread");
       BiasedLocking::revoke_at_safepoint(obj);
     }
